@@ -1,0 +1,1162 @@
+---
+title: "Certificat Data Scientist<br />Document Data Pipeline"
+subtitle: "Exemple avec Web scraping, MongoDB et agrégation"
+author: "Xavier Gendre"
+date: '`r stringr::str_to_title(format(Sys.Date(), "%B %Y"))`'
+output:
+  ioslides_presentation:
+    css: pipeline.css
+    transition: faster
+    widescreen: true
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+# Affiche les chunks par défaut
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+<div class="boxed">Un **pipeline de traitement de données** (*data pipeline*) fait le lien entre des **producteurs de données** (*data producers*) et des **consommateurs de données** (*data consumers*).</div>
+
+**Objectif :** présenter un exemple simple de pipeline de traitement de données orientée document.
+
+- Récupération de données depuis des sites internet
+- Filtrage et mise en forme des données
+- Stockage dans une base de données
+- Exploitation et valorisation des données
+
+# JSON, un format document
+
+## Notion de document
+
+Pas de réelle définition mais quelques propriétés :
+
+- un **document** contient des données encodées dans un certain **format**,
+- le **contenu** d'un document est un ensemble de paires **clé/valeur**,
+- absence de **schéma** fixe a priori,
+- un document peut contenir d'autres documents.
+
+Exemples :
+
+- format texte : **JSON**, XML, YML, ...
+- format binaire : BSON, PDF, ...
+
+## Format JSON
+
+JSON (*JavaScript Object Notation*) est un format document léger et très utilisé qui se veut lisible autant par des humains que par des machines.
+
+La syntaxe est simple et un document se présente comme un **objet** unique délimité par des accolades `{}`. Les paires clé/valeur sont séparées par des virgules.
+
+```{json}
+{
+  "clé1": valeur1,
+  "clé2": valeur2,
+  ...
+}
+```
+
+Les clés sont des chaînes de caractères délimitées par des guillemets `""` et tous les caractères blancs (espace, tabulation et retour à la ligne) sont ignorés.
+
+## Format JSON - Types simples
+
+- **chaîne de caractères** : séquence de caractères Unicode délimitée par des guillemets `""`,
+- **nombre** : flottants double précision (notation entière, décimale ou scientifique),
+- **booléen** : `true` et `false` (en minuscules),
+- **null** : valeur vide.
+
+```{json}
+{
+  "nom": "Gandalf",
+  "taille": 1.68,
+  "anneaux": 1,
+  "magicien": true,
+  "résidence": null
+}
+```
+
+## Format JSON - Types structurés
+
+- **tableau** : liste **ordonnée** de valeurs entre crochets `[]` (similaire aux vecteurs de **R**),
+- **objet** : liste **non ordonnée** de paires clé/valeur entre accolades `{}` (similaire aux listes de **R**).
+
+```{json}
+{
+  "nom": "Gandalf",
+  "stuff": ["Glamdring", "Bâton de magicien", "Narya"],
+  "alias": {
+    "sindarin": "Mithrandir",
+    "quenya": "Olórin"
+  }
+}
+```
+
+## Format JSON - Imbrication
+
+Pour un type structuré, les valeurs peuvent être de n'importe quel type y compris un autre type structuré.
+
+```{json}
+{
+  "nom": "Sacquet", "prénom": "Frodon",
+  "amis": [
+    {
+      "nom": "Gamegie", "prénom": "Samsagace"
+    },
+    {
+      "nom": "Brandebouc", "prénom": "Meriadoc"
+    },
+    {
+      "nom": "Touque", "prénom": "Peregrin"
+    }
+  ]
+}
+```
+
+
+## Package `jsonlite`
+
+Le package [`jsonlite`](https://cran.r-project.org/web/packages/jsonlite/index.html) permet de manipuler simplement des données document au format JSON avec **R**.
+
+```{r}
+library(jsonlite)
+json <- toJSON(list(nom="Gandalf", taille=1.68, residence=NA), pretty=TRUE)
+class(json); typeof(json); print(json)
+```
+
+## Package `jsonlite` - Import/Export
+
+La fonction `toJSON` permet d'exporter un objet **R** en JSON et la fonction `fromJSON` permet d'importer un objet JSON dans **R**.
+
+```{r}
+df <- fromJSON(json)
+typeof(df); print(df)
+```
+
+## Package `jsonlite` - Objets JSON et **R**
+
+Le package `jsonlite` met (presque) en place une bijection entre la structure des données dans un document JSON et l'objet **R** retourné par `fromJSON`.
+
+```{r}
+obj <- list(nom="Sauron", residence="Mordor")
+toJSON(obj)
+all.equal(obj, fromJSON(toJSON(obj)))
+```
+
+## Package `jsonlite` - Data frames
+
+<div class="halfleft">
+```{r}
+obj <- data.frame(
+  nom=c("Aragorn", "Boromir"),
+  age=c(210, 41),
+  maison=c("Isildur", "Húrin"),
+  stringsAsFactors=FALSE)
+
+all.equal(obj,
+          fromJSON(toJSON(obj)))
+```
+</div>
+
+<div class="halfright">
+```{r}
+toJSON(obj, pretty=TRUE)
+```
+</div>
+
+## Package `jsonlite` - Quelques remarques
+
+- Les valeurs manquantes ne sont tout simplement pas stockées.
+
+```{r}
+toJSON(data.frame(v1=c(FALSE,  TRUE, NA,        NA),
+                  v2=c("Elfe",   NA, NA, "Tolkien")))
+```
+
+- Pour gérer des **flux** de données, le package `jsonlite` propose les fonctions `stream_in` et `stream_out`. Celles-ci permettent de manipuler des données au format [NDJSON](http://ndjson.org/), *i.e.* du JSON "ligne par ligne". Nous y reviendrons ...
+
+```{r}
+stream_out(obj) # stream_out(obj, file("/tmp/dump.json")) pour exporter dans un fichier
+```
+
+
+## Obtenir du JSON avec une API
+
+De nombreux sites proposent des API pour faire des requêtes et retournent les résultats au format JSON.
+
+Quelques exemples :
+
+https://lotr.fandom.com/api/v1/Articles/List/?limit=25
+
+https://lotr.fandom.com/api/v1/Articles/Details/?ids=61&abstract=100
+
+https://lotr.fandom.com/api/v1/Search/List/?query=bombadil&limit=10&minArticleQuality=95&batch=5
+
+Ces interfaces peuvent être utilisées dans un navigateur (peu utile), en ligne de commande (cURL, ...) et, bien sûr, avec R.
+
+## Obtenir du JSON avec une API
+
+```{r}
+articles <- fromJSON("https://lotr.fandom.com/api/v1/Articles/List/?limit=25")
+names(articles)
+articles$items[1,]
+nrow(articles$items)
+```
+
+## Regrouper des données
+
+La plupart du temps, les API limitent le nombre de réponses par requête et imposent l'utilisation de pages qui peuvent être combinées dans un data frame avec `rbind_pages`.
+
+```{r cache=TRUE}
+url <- "https://lotr.fandom.com/api/v1/Search/List/?query=bombadil&limit=10"
+pages <- list()
+for (i in 1:5) {
+  data_page <- paste0(url, "&batch=", i) %>% fromJSON()
+  pages[[i]] <- data_page$items
+}
+items <- rbind_pages(pages)
+nrow(items)
+```
+
+----
+
+<div class="exercice">À vous de jouer!</div>
+
+# Web scraping
+
+## Le Web sans API
+
+Les sites Web sont une source importante d'information :
+
+- site interne d'entreprise,
+- Wikipedia,
+- IMDb,
+- ...
+
+Tous les sites ne disposent pas d'une API pour récolter de l'information (outil non pertinent, manque de moyens, modèle économique, ...).
+
+Cependant, l'information est assez structurée pour que nous puissions la récupérer de façon semi-automatisée.
+
+## Objectif
+
+Cate Blanchett interprète le rôle de *Galadriel* dans les films de Peter Jackson. Nous allons chercher avec quel acteur Cate Blanchett a le plus joué dans les années 2000.
+
+Nous pouvons commencer par visiter la section dédiée à la filmographie de Cate Blanchett sur sa page Wikipedia.
+
+https://fr.wikipedia.org/wiki/Cate_Blanchett#Filmographie
+
+Nous constatons que :
+
+- les films sont classés par décennie,
+- chaque titre de film (sauf un) possède un lien vers une page dédiée,
+- ces pages contiennent des listes d'acteurs.
+
+## Package `rvest`
+
+Le package [`rvest`](https://cran.r-project.org/web/packages/rvest/index.html) permet de manipuler le contenu de pages Web depuis **R** en travaillant sur son contenu brut (**HTML** et **CSS**). Son installation demande quelques prérequis extérieurs à **R** tels que le programme **cURL** mais tout est expliqué à l'installation.
+
+```{r eval=FALSE}
+install.packages("rvest")
+```
+
+Pour utiliser `rvest`, cela commence comme avec n'importe quel autre package.
+
+```{r}
+library(rvest)
+```
+
+## HTML et CSS
+
+Le travail d'un navigateur Web est de transformer des fichiers textes en pages lisibles et bien présentées. En simplifiant le fonctionnement, cela se décompose dans :
+
+- des **informations structurées** contenues dans un fichier HTML,
+- du **code de présentation** dans des feuilles de style CSS.
+
+Ainsi, c'est dans le fichier source HTML que nous allons trouver les informations que nous voulons. 
+
+## Arbre DOM
+
+Le contenu d'un fichier HTML est un format document comme ce que nous avons vu pour le JSON.
+
+Les données sont organisées de façon **arborescente**.
+
+```{html}
+<h4>Longs-métrages</h4>
+  <h5>Années 1990</h5>
+  <ul>
+    <li>...</li>
+  </ul>
+```
+
+L'interface de programmation **Document Object Model** (**DOM**) permet d'examiner et de modifier cet arbre et donc le contenu d'une page Web. C'est de cette façon que des pages Web dynamiques sont créées.
+
+## Premier essai - Données
+
+Le package `rvest` permet de parcourir l'arbre DOM et de récupérer des informations.
+
+```{r}
+url_wikipedia <- "https://fr.wikipedia.org/"
+url_blanchett <- "wiki/Cate_Blanchett"
+url <- paste0(url_wikipedia, url_blanchett)
+
+data_html <- read_html(url)
+data_html
+```
+
+## Premier essai - Titres de section
+
+Les éléments de l'arbre sont appelés des **nœuds** et peuvent être extraits avec la fonction `html_nodes`. Dans notre cas, nous sommes intéressés par les sections de niveau `h5`.
+
+```{r}
+data_html %>% html_nodes("h5") %>% head(1)
+```
+
+`html_nodes` donne plus d'informations que le seul contenu textuel du titre.
+
+```{r}
+data_html %>% html_nodes("h5") %>% head(1) %>% html_text()
+```
+
+## Sélectionner des nœuds
+
+La fonction `html_nodes` joue un rôle central pour le web scraping car elle permet de sélectionner les nœuds contenant les informations d'intérêt. Pour faire cette sélection, deux méthodes sont disponibles :
+
+- **sélecteurs CSS** : motifs CSS pour identifier une catégorie d'éléments (`p` pour les paragraphes, `h5` pour les titres de niveau 5, ...),
+- **XPath** : standard W3C pour identifier des informations dans un document XML.
+
+Les sélecteurs CSS sont plus simples et conviennent pour une utilisation occasionnelle. Pour un usage plus fréquent, la puissance de XPath sera privilégiée.
+
+Concrètement, le package `rvest` n'utilise que XPath et les sélecteurs CSS sont silencieusment transformés en syntaxe XPath.
+
+## Sélectionner des nœuds - Sélecteurs CSS
+
+Voici comment récupérer les **attributs** (fonction `html_attrs`) des nœuds des films de Cate Blanchett des années 2000.
+
+```{r}
+css_select <- '#mw-content-text > div > ul:nth-of-type(3) > li > i:nth-of-type(1) > a'
+films_css <- data_html %>% html_nodes(css_select) %>% html_attrs()
+length(films_css)
+films_css[[1]]
+```
+
+## Sélectionner des nœuds - Sélecteurs CSS
+
+Voici comment récupérer les **attributs** (fonction `html_attrs`) des nœuds des films de Cate Blanchett des années 2000.
+
+```{r}
+css_select <- '#mw-content-text > div > ul:nth-of-type(3) > li > i:nth-of-type(1) > a'
+```
+
+Quelques explications :
+
+- `#mw-content-text` est un **sélecteur d'identifiant** (`id="..."` en CSS),
+- le **sélecteur d'enfant**, noté `>`, permet d'utiliser la filiation pour désigner un élément par rapport à un autre,
+- `ul:nth-of-type(3)` signifie que nous ne voulons extraire que le 3ème élément `ul` dans la liste des enfants (**pseudo-classe CSS**),
+
+Mais... D'où est-ce que ça sort ? (Réponse brutale : `Copy > CSS Selector` mais nous venons de voir comment être plus fins)
+
+## Sélectionner des nœuds - XPath
+
+Pour utiliser XPath, il faut utiliser explicitement l'argument `xpath`.
+
+```{r}
+xpath_str <- '//*[@id="mw-content-text"]
+  /div/ul[
+    preceding::h5[span/@id="Années_2000"]
+    and
+    following::h5[span/@id="Années_2010"]
+  ]/li/i[1]/a'
+films_xpath <- data_html %>% html_nodes(xpath=xpath_str) %>% html_text()
+length(films_xpath)
+films_xpath %>% head(3)
+```
+
+## Sélectionner des nœuds - XPath
+
+Pour utiliser XPath, il faut utiliser explicitement l'argument `xpath`.
+
+```{r}
+xpath_str <- '//*[@id="mw-content-text"]
+  /div/ul[
+    preceding::h5[span/@id="Années_2000"]
+    and
+    following::h5[span/@id="Années_2010"]
+  ]/li/i[1]/a'
+```
+
+Quelques explications :
+
+- `//*[@id="mw-content-text"]` sélectionne le sous-arbre de tous les nœuds descendants de cet identifiant,
+- `/ul[...]` filtre les `<ul>` dans ce sous-arbre qui suivent une balise `<h5>` contenant un `<span>` identifié par `Années_2000` et précèdent une balise `<h5>` contenant un `<span>` identifié par `Années_2010`,
+- `/i[1]` sélectionne le premier `<i>` de la liste.
+
+## Distribution d'un film
+
+Appliquons ce que nous venons de voir pour récupérer la liste des acteurs du film *Heaven* (2002).
+
+```{r}
+url_film <- "wiki/Heaven_(film,_2002)"
+url <- paste0(url_wikipedia, url_film)
+data_html <- read_html(url)
+data_html
+```
+
+Le découpage entre `url_wikipedia` et `url_film` sera important pour automatiser cette démarche.
+
+## Distribution d'un film
+
+```{r}
+xpath_str <- '(
+    //*[@id="mw-content-text"]//ul[preceding::h2[span/@id="Distribution"]]
+  )[1]/li/a[1]'
+data_html %>% html_nodes(xpath=xpath_str) %>% html_text()
+```
+
+Quelques explications :
+
+- les parenthèses `()` permettent de définir un sélecteur complexe,
+- un seul slash `/` sélectionne **depuis le nœud courant** alors qu'un double `//` sélectionne **tous les descendants** du nœud courant.
+
+## Application
+
+Nous commençons par la liste des films.
+
+```{r}
+url_wikipedia <- "https://fr.wikipedia.org/"
+url_blanchett <- "wiki/Cate_Blanchett"
+data_html <- paste0(url_wikipedia, url_blanchett) %>% read_html()
+
+xpath_films <- '//*[@id="mw-content-text"]
+  /div/ul[
+    preceding::h5[span/@id="Années_2000"]
+    and
+    following::h5[span/@id="Années_2010"]
+  ]/li/i[1]/a'
+films <- data_html %>% html_nodes(xpath=xpath_films) %>% html_attrs()
+
+length(films)
+```
+
+## Application
+
+Chaque film a un titre (`title`) et un lien vers sa page (`href`) ...
+
+```{r}
+films[[1]]
+```
+
+... sauf un!
+
+```{r}
+films[[15]]
+```
+
+## Application
+
+Nous pouvons maintenant récolter la liste des acteurs.
+
+```{r cache=TRUE}
+acteurs <- tibble()
+xpath_dist <- '(
+    //*[@id="mw-content-text"]//ul[preceding::h2[span/@id="Distribution"]]
+  )[1]/li/a[1]'
+
+for(i in seq_along(films)) {
+  if("class" %in% names(films[[i]])) next # Absence de page dédiée
+  url_film <- films[[i]]["href"]
+  data_html <- paste0(url_wikipedia, url_film) %>% read_html()
+  film_dist <- data_html %>% html_nodes(xpath=xpath_dist) %>% html_text()
+  acteurs <- acteurs %>% rbind(tibble(nom=film_dist, titre=films[[i]]["title"]))
+}
+```
+
+## Application
+
+La réponse s'obtient grâce aux outils de `dplyr`.
+
+```{r}
+acteurs %>%
+  group_by(nom) %>%
+  summarise(n=n(), .groups='drop') %>%
+  arrange(desc(n)) %>%
+  head(4)
+```
+
+À égalité, il s'agit de Hugo Weaving (*Elrond*) et de John Rhys-Davies (*Gimli*) !
+
+----
+
+<div class="exercice">À vous de jouer!</div>
+
+# MongoDB, une base de données orientée documents
+
+## Présentation
+
+Il s'agit d'un **logiciel libre** sous double licences (GNU AGPL v3.0 et Apache v2.0).
+
+La communcation se fait selon le principe **client-serveur**. Il s'agit d'un système de gestion de base de données populaire et réputé facile d'utilisation :<br />http://db-engines.com/en/ranking
+
+La langue maternelle de MongoDB est le **JavaScript** pour l'exécution de fonctions côté serveur. Les objets manipulés sont au format **BSON** (JSON binaire).
+
+<img class="mongo_logo" src="img/MongoDB-Logo.png" />
+
+## NoSQL
+
+MongoDB fait partie de la mouvance NoSQL au titre de système de gestion de base de données **orienté documents**.
+
+Les données manipulées sont des documents enrichis d'un champ `_id` et enregistrés dans des **collections**.
+
+- **Imbrication de documents** : cela permet une **approche relationnelle**.
+- **Absence de schéma** : pour créer un document (ou une collection), il suffit de l'utiliser mais cette simplicité implique que **toute faute de frappe peut avoir des conséquences importantes**.
+
+## Package `mongolite`
+
+Le package [`mongolite`](https://cran.r-project.org/web/packages/mongolite/) permet de se connecter à un serveur MongoDB local ou distant et d'interagir avec lui depuis **R**. Son installation demande que les bibliothèques de développement de **OpenSSL** et **Cyrus SASL** soient présentes sur le système mais tout est expliqué à l'installation.
+
+```{r eval=FALSE}
+install.packages("mongolite")
+```
+
+Nous pouvons ensuite charger le package pour commencer à travailler avec MongoDB depuis **R**.
+
+```{r}
+library(mongolite)
+```
+
+## Connexion
+
+La première étape est de se connecter au serveur MongoDB. Par défaut, la connexion est locale (**localhost**) mais elle peut être distante.
+
+```{r}
+user <- "readwrite"
+pass <- "test"
+host <- "mongo.opencpu.org"
+port <- "43942"
+path <- "/jeroen_test"
+opts <- "?retryWrites=false"
+url <- paste0("mongodb://", user, ":", pass, "@", host, ":", port, path, opts)
+```
+
+Pour ouvrir la connexion avec le serveur MongoDB, nous utilisons la fonction `mongo` avec un nom de collection pour récupérer un objet **R** permettant d'interagir avec elle.
+
+```{r}
+collection <- "change_me" # Choisir un nom pour votre collection
+m <- mongo(collection, url=url) # mongo(collection) pour une connexion locale
+```
+
+## Premier contact
+
+La collection n'a pas besoin d'être préalablement créée et l'objet retourné par `mongo` offre plusieurs méthodes pour la manipuler. Par exemple, `count` sans paramètre retourne le nombre de documents.
+
+```{r}
+m$count()
+```
+
+Si la collection a déjà été utilisée, elle peut être vidée avec la méthode `drop`.
+
+```{r}
+if(m$count() > 0) m$drop()
+```
+
+**Attention, sur un serveur partagé, la collection peut être en cours d'utilisation par une autre personne! Il est conseillé de choisir un nom original pour faire des essais sans être perturbé.**
+
+## Insertion
+
+La méthode `insert` permet d'ajouter des éléments à la collection.
+
+```{r}
+# Cartes du jeu "The Lord of the Rings: The Card Game"
+m$insert(fromJSON("https://ringsdb.com/api/public/cards"))
+m$count()
+```
+
+## Insertion
+
+L'absence de schéma permet d'insérer des documents qui n'ont pas la même structure.
+
+```{r}
+m$insert(list(name="Luke Skywalker", outlier=TRUE))
+m$count()
+```
+
+## Recherche
+
+La méthode `find` permet de faire une recherche dans la collection. Sans paramètre, toute la collection est retournée.
+
+```{r eval=FALSE}
+m$find()
+```
+
+Il est possible de définir des critères de recherche avec l'argument `query`. Le format JSON est utilisé pour cela.
+
+```{r eval=FALSE}
+m$find(query='{"type_name": "Contract"}')
+```
+
+L'argument `fields` permet de limiter les champs retournés (par défaut, `_id` est toujours retourné).
+
+```{r eval=FALSE}
+m$find(query='{"type_name": "Contract"}', fields='{"name": 1, "illustrator": 1}')
+```
+
+## Recherche - Exemple
+
+```{r}
+m$find(query='{"type_name": "Contract"}',
+       fields='{"_id": 0, "pack_name": 1, "name": 1, "illustrator": 1}')
+```
+
+## Recherche - Opérateurs
+
+Il est possible d'utiliser des opérateurs dans l'argument `query`. Ils sont précédées du caractère '`$`'.
+
+- `$exists` pour tester l'existence d'un champ,
+
+```{r}
+m$find(query='{"outlier": {"$exists": true} }', fields='{"_id": 0, "name": 1}')
+```
+
+- `$and`, `$or`, `$nor` et `$not` pour la logique,
+
+```{r}
+m$find(query='{"$and": [{"type_name": "Contract"}, {"illustrator": "Leanna Crossan"}]}',
+       fields='{"_id": 0, "name": 1}')
+```
+
+## Recherche - Opérateurs
+
+- `$regex` pour utiliser des expressions régulières,
+
+```{r}
+m$find(query='{"name": {"$regex": "^Z", "$options" : "i"} }',
+       fields='{"_id": 0, "name": 1}')
+```
+
+- `$lt`, `$lte`, `$gt` et `$gte` pour comparer des nombres,
+
+```{r}
+m$find(query='{"attack": {"$gte": 4} }',
+       fields='{"_id": 0, "name": 1, "attack": 1}') %>% head(3)
+```
+
+## Recherche - Opérateurs
+
+- `$ne` pour tester la non-égalité,
+
+```{r}
+m$find(query='{"pack_name": {"$ne": "Core Set"} }',
+       fields='{"_id": 0, "pack_name": 1, "name": 1}') %>% head(3)
+```
+
+- Et bien d'autres : `$in` pour l'inclusion, `$nin` pour la non-inclusion, `$all` pour l'inclusion stricte, `$size` pour la taille d'un tableau, `$type` pour le type d'une valeur, `$mod` pour le modulo, ...<br />https://docs.mongodb.com/manual/reference/operator/query/
+
+## Compter
+
+La méthode `count` permet de compter les documents qui vérifient des conditions données.
+
+```{r}
+m$count('{"pack_name": "Core Set"}')
+m$count('{"$and": [
+  {"pack_name": "Core Set"},
+  {"type_name": {"$in": ["Hero", "Contract"]}}
+]}')
+```
+
+## Valeurs uniques
+
+La méthode `distinct` retourne la liste des valeurs prises par une clé parmi les documents vérifiant une recherche donnée.
+
+```{r}
+m$distinct(key="type_name")
+m$distinct(key="illustrator", query='{"pack_name": "The Hunt for Gollum"}')
+```
+
+## Tri
+
+L'argument `sort` de la méthode `find` permet de trier les résultats selon les valeurs d'un champ (`1` pour l'ordre croissant et `-1` pour le décroissant).
+
+```{r}
+m$find(
+  query='{"threat": {"$exists": true} }',      # Supprime les NA
+  fields='{"_id": 0, "name": 1, "threat": 1}', # Le nom et le niveau de menace
+  sort='{"threat": -1}'                        # En partant du plus menaçant
+) %>% head(5)
+```
+
+## Suppression
+
+Nous avons déjà vu `drop` pour vider une collection. La méthode `remove` supprime les entrées correspondant à une recherche donnée.
+
+```{r}
+m$count()
+m$remove(query='{"outlier": {"$exists": true} }')
+m$count()
+```
+
+## Itération
+
+La méthode `iterate` prend les mêmes arguments que `find` et retourne un **itérateur** pour parcourir le résultat de la recherche ligne par ligne à l'aide de `$one` (ou par page avec `$page`). Une fois le dernier élément retourné, l'itérateur devient obsolète.
+
+```{r}
+it <- m$iterate(query='{"$and": [{ "threat": {"$gte": 13} },
+                                 { "health": {"$gte":  5} }]}',
+                fields='{"_id": 0, "name": 1}',
+                sort='{"name": 1}')
+while(!is.null(item <- it$one())) {
+  cat("Respect à toi, ô", item$name, "!\n")
+}
+```
+
+## Import/Export
+
+Le format par défaut pour ces opérations est le NDJSON (*Newline Delimited JSON*) que nous avons évoqué pour la gestion des flux avec `jsonlite`.
+
+Les méthodes `export` et `import` sont très simples.
+
+```{r}
+# Exporte la collection vers un fichier
+m$export(file("/tmp/dump.json"))
+# Purge la collection
+m$drop(); m$count()
+# Importe la collection depuis un fichier
+m$import(file("/tmp/dump.json"))
+m$count()
+```
+
+## Import/Export - Gestion des flux
+
+Grâce aux fonctions `stream_in` et `stream_out` de `jsonlite`, nous pouvons mettre en place des mécanismes élégants pour importer des données obtenues par flux (réseau, capteur, ...).
+
+Un flux se décompose en **pages** de taille donnée et le principe est de stocker chaque page (fichier temporaire, mémoire, ...) avant de l'importer dans la collection.
+
+L'avantage de cette approche est que nous pouvons faire agir une fonction `handler` à ce moment pour **manipuler les données avant l'import**.
+
+## Import/Export - Gestion des flux (Exemple)
+
+La variable `traits` des données de *The Lord of the Rings: The Card Game* est une chaîne de caractères qui contient plusieurs informations. Ce n'est pas bien formaté et nous souhaitons la remplacer par un tableau contenant ces informations pour tester l'inclusion (opérateur `$in`).
+
+```{r}
+m$find(fields='{"_id": 0, "name": 1, "traits": 1}') %>% head(2)
+m$find(query='{"traits": {"$in": ["Dwarf"]} }',
+       fields='{"_id": 0, "name": 1, "traits": 1}')
+```
+
+## Import/Export - Gestion des flux (Exemple)
+
+```{r eval=FALSE}
+# Purge la collection
+m$drop()
+# Fichier temporaire pour stocker les pages
+ftmp <- file(tempfile(), open="w+b")
+# Importation d'un flux depuis un fichier (400 documents par page)
+file("/tmp/dump.json") %>%
+  stream_in(pagesize=400,          # Taille des pages
+            handler=function(df) { # Handler de page
+              cat(" [", nrow(df), "ligne(s) lue(s) ]")
+              df$traits <- df$traits %>%
+                strsplit(split=' ') %>%
+                sapply(function(s) { gsub('\\.', '', s) })
+              stream_out(df, ftmp)
+              m$import(ftmp)
+            })
+# Fermeture du fichier temporaire
+close(ftmp)
+```
+
+## Import/Export - Gestion des flux (Exemple)
+
+```{r echo=FALSE}
+# Purge la collection
+m$drop()
+# Fichier temporaire pour stocker les pages
+ftmp <- file(tempfile(), open="w+b")
+# Importation d'un flux depuis un fichier (400 documents par page)
+file("/tmp/dump.json") %>%
+  stream_in(pagesize=400,          # Taille des pages
+            handler=function(df) { # Handler de page
+              cat(" [", nrow(df), "ligne(s) lue(s) ]")
+              df$traits <- df$traits %>%
+                strsplit(split=' ') %>%
+                sapply(function(s) { gsub('\\.', '', s) })
+              stream_out(df, ftmp)
+              m$import(ftmp)
+            })
+# Fermeture du fichier temporaire
+close(ftmp)
+```
+
+## Import/Export - Gestion des flux (Exemple)
+
+Il est possible de rendre la sortie moins verbeuse avec l'option `verbose=FALSE`.
+
+Voici le résultat :
+```{r}
+m$find(fields='{"_id": 0, "name": 1, "traits": 1}') %>% head(2)
+m$find(query='{"traits": {"$in": ["Dwarf"]} }',
+       fields='{"_id": 0, "name": 1, "traits": 1}') %>% head(2)
+```
+
+## Modification
+
+Pour modifier un document de la collection, la méthode `update` procède en deux temps :
+
+- rechercher le(s) document(s) à modifier,
+- apporter les modifications au(x) document(s).
+
+Par défaut, un seul document peut être modifier. Pour appliquer les modifications à plusieurs documents, il faut utiliser l'argument `multiple=TRUE`.
+
+La recherche se fait avec l'argument `query` et les modifications avec `update`.
+
+## Modification - Changer une valeur
+
+Utilisons `$set` pour changer la valeur d'une clé (ou créer la paire clé/valeur).
+
+```{r results='hide'}
+m$update(query='{"name": "Gandalf"}',
+         update='{"$set": {"cheveux": "gris"}}')
+```
+
+```{r}
+m$find(query='{"name": "Gandalf"}', fields='{"_id": 0, "name": 1, "cheveux": 1}')
+```
+
+## Modification - Changer une valeur
+
+Utilisons `$set` pour changer la valeur d'une clé (ou créer la paire clé/valeur).
+
+```{r results='hide'}
+m$update(query='{"name": "Gandalf"}',
+         update='{"$set": {"cheveux": "gris"}}',
+         multiple=TRUE) # Tous les documents sont modifiés
+```
+
+```{r}
+m$find(query='{"name": "Gandalf"}', fields='{"_id": 0, "name": 1, "cheveux": 1}')
+```
+
+## Modification - Supprimer une paire clé/valeur
+
+La suppression d'une paire se fait avec `$unset`.
+
+```{r results='hide'}
+m$update(query='{"name": "Gandalf"}',
+         update='{"$unset": {"cheveux": "gris"}}',
+         multiple=TRUE) # Tous les documents sont modifiés
+```
+
+```{r}
+m$find(query='{"name": "Gandalf"}', fields='{"_id": 0, "name": 1, "cheveux": 1}')
+```
+
+## Modification - Autres
+
+De nombreuses commandes sont disponibles :
+
+- `$push`, `$pull`, `$addToSet`, ... pour modifier un tableau,
+- `$inc`, `$mul`, ... pour modifier une valeur numérique,
+- `$rename` pour renommer une clé,
+- ...
+
+https://docs.mongodb.com/manual/reference/operator/update/
+
+----
+
+<div class="exercice">À vous de jouer!</div>
+
+# Agrégation et MapReduce
+
+## Motivation - Table de contingence
+
+Nous souhaitons compter le nombre de cartes par *Sphere* et par *Type*.
+
+**Méthode brutale**
+
+```{r eval=FALSE}
+v_sphere <- m$distinct(key="sphere_name")
+v_type <- m$distinct(key="type_name")
+tdc <- matrix(0L, nrow=length(v_sphere), ncol=length(v_type),
+              dimnames=list(v_sphere, v_type))
+for(sphere in v_sphere) {
+  for(type in v_type) {
+    query <- paste0('{"$and": [{"sphere_name":"', sphere, '"},',
+                              '{"type_name":"', type, '"}]}')
+    tdc[sphere, type] <- m$count(query)
+  }
+}
+print(tdc)
+```
+
+## Motivation - Table de contingence
+
+Nous souhaitons compter le nombre de cartes par *Sphere* et par *Type*.
+
+**Méthode brutale**
+
+```{r echo=FALSE}
+v_sphere <- m$distinct(key="sphere_name")
+v_type <- m$distinct(key="type_name")
+tdc <- matrix(0L, nrow=length(v_sphere), ncol=length(v_type),
+              dimnames=list(v_sphere, v_type))
+for(sphere in v_sphere) {
+  for(type in v_type) {
+    query <- paste0('{"$and": [{"sphere_name":"', sphere, '"},',
+                              '{"type_name":"', type, '"}]}')
+    tdc[sphere, type] <- m$count(query)
+  }
+}
+print(tdc)
+```
+
+- C'est très moche!
+- Il y a beaucoup d'aller-retours entre le client et le serveur.
+
+## Motivation - Table de contingence
+
+Nous souhaitons compter le nombre de cartes par *Sphere* et par *Type*.
+
+**Méthode R**
+
+```{r}
+table(m$find(fields='{"_id": 0, "sphere_name": 1, "type_name": 1}'))
+```
+
+## Motivation - Table de contingence
+
+Nous souhaitons compter le nombre de cartes par *Sphere* et par *Type*.
+
+**Méthode R**
+
+```{r eval=FALSE}
+table(m$find(fields='{"_id": 0, "sphere_name": 1, "type_name": 1}'))
+```
+
+- C'est plus propre!
+- Une seule requête mais elle retourne un objet potentiellement volumineux.
+- Tous les calculs se font côté client.
+
+## Agrégateurs
+
+Un *agrégateur* est une fonction qui regroupe les valeurs contenues dans plusieurs documents sélectionnés et retourne une structure contenant des objets "simples" et "plus informatifs".
+
+<img class="center" src="img/agregateur.png" height="400px" />
+
+## Agrégateurs
+
+Les méthodes `count` et `distinct` sont des agrégateurs.
+
+```{r eval=FALSE}
+m$count('{"type_name": "Hero"}')
+```
+
+<img class="center" src="img/count.png" width="70%" />
+
+## Agrégateurs
+
+Les méthodes `count` et `distinct` sont des agrégateurs.
+
+```{r eval=FALSE}
+m$distinct(key="pack_name", query='{"type_name": "Hero"}')
+```
+
+<img class="center" src="img/distinct.png" width="100%" />
+
+## Pipeline d'agrégation
+
+Le **pipeline d'agrégation** de MongoDB est une séquence de **stages** à traverser pour transformer des documents en un résultat agrégé.
+
+Même si nous en verrons un autre dans la suite, il s'agit du modèle d'agrégation **privilégié** de MongoDB.
+
+Les stages filtrent, transforment, groupent, trient, ... les documents dans un ordre établi. Par exemple :
+
+- `$match` (filtre comme avec `query`),
+- `$group` (regroupe et accumule),
+- `$sort` (trie).
+
+Pour les autres stages (`$project`, `$limit`, `$skip`, `$sample`, `$out`,...), voir :<br />https://docs.mongodb.com/manual/reference/operator/aggregation-pipeline/
+
+## Pipeline d'agrégation - Méthode `aggregate`
+
+La méthode `aggregate` permet de contruire un agrégateur basé sur le modèle du pipeline d'agrégation. Cette méthode prend un tableau en paramètre contenant les différentes étapes à réaliser.
+
+## Pipeline d'agrégation - Méthode `aggregate`
+
+La méthode `aggregate` permet de contruire un agrégateur basé sur le modèle du pipeline d'agrégation. Cette méthode prend un tableau en paramètre contenant les différentes étapes à réaliser.
+
+Illustration avec `count` :
+```{r}
+m$aggregate('[
+  { "$match": { "type_name": "Hero" } },
+  { "$group": { "_id": null, "count": { "$sum": 1 } } }
+]')
+```
+
+## Pipeline d'agrégation - Méthode `aggregate`
+
+```{r eval=FALSE}
+m$aggregate('[
+  { "$match": { "type_name": "Hero" } },
+  { "$group": { "_id": null, "count": { "$sum": 1 } } }
+]')
+```
+
+Quelques explications :
+
+- `$match` est similaire à `query`,
+- le champ `_id` de `$group` reçoit la clé utilisée pour les groupes ou `null` pour considérer tous les documents,
+- le champ `count` de `$group` est le nom de l'**accumulateur** défini en suivant,
+- la valeur des accumulateurs est maintenue groupe par groupe,
+- la définition des accumulateurs est évaluée pour chaque document.
+
+## Pipeline d'agrégation - Exemple de `distinct`
+
+Pour imiter la méthode `distinct`, nous pouvons utiliser
+
+```{r}
+m$aggregate('[
+  { "$group": { "_id": "$sphere_name" } }
+]')
+```
+
+## Pipeline d'agrégation - Exemple de `distinct`
+
+Pour imiter la méthode `distinct`, nous pouvons utiliser
+
+```{r eval=FALSE}
+m$aggregate('[
+  { "$group": { "_id": "$sphere_name" } }
+]')
+```
+
+ou bien
+
+```{r}
+m$aggregate('[
+  { "$group": { "_id": null, "sphere_name": { "$addToSet": "$sphere_name" } } }
+]')
+```
+
+## Pipeline d'agrégation - Tri
+
+Voici comment compter des effectifs et les trier :
+
+```{r}
+m$aggregate('[
+  { "$group": { "_id": "$sphere_name", "count": { "$sum": 1 } } },
+  { "$sort": { "count": -1 } }
+]')
+```
+
+## Pipeline d'agrégation - Table de contingence
+
+Pour des effectifs croisés, `_id` est un peu plus compliqué ...
+
+```{r}
+m$aggregate('[
+  { "$group": { "_id": { "sphere_name": "$sphere_name", "type_name": "$type_name" },
+                "count": { "$sum": 1 } } }
+]') %>% head(10)
+```
+
+## Pipeline d'agrégation - Opérateurs
+
+Des opérateurs sont disponible pour calculer des résultats plus avancés.
+
+```{r}
+m$aggregate('[
+  { "$group": { "_id": "$sphere_name",
+                 "attack": { "$avg": "$attack" },
+                 "defense": { "$avg": "$defense" } } }
+]')
+```
+
+## Pipeline d'agrégation - Opérateurs
+
+Des opérateurs sont disponible pour calculer des résultats plus avancés.
+
+```{r eval=FALSE}
+m$aggregate('[
+  { "$group": { "_id": "$sphere_name",
+                 "attack": { "$avg": "$attack" },
+                 "defense": { "$avg": "$defense" } } }
+]')
+```
+
+```{r sphere_stat, echo=FALSE, fig.align="center", fig.height=3, fig.width=10}
+data_tmp <- m$aggregate('[
+  { "$group": { "_id": "$sphere_name",
+                 "attack": { "$avg": "$attack" },
+                 "defense": { "$avg": "$defense" } } }
+]')
+opar <- par(mar=c(4, 4, 0.1, 0.1))
+plot(data_tmp$attack, data_tmp$defense, pch=16, xlab="Attack", ylab="Defense", col=rainbow(nrow(data_tmp)))
+text(data_tmp$attack, data_tmp$defense, labels=data_tmp$`_id`, col=rainbow(nrow(data_tmp)), pos=2)
+par(opar)
+```
+
+## Pipeline d'agrégation - Opérateurs
+
+Pour aller plus loin ...<br />https://docs.mongodb.com/manual/reference/operator/aggregation/
+
+```{r}
+m$aggregate('[
+  { "$match": { "threat": { "$exists": true } } },
+  { "$project": { "niveau": { "$cond": [ { "$lt": ["$threat", 10] },
+                                        "Faiblard", "Balèze"] } } },
+  { "$group": { "_id": "$niveau", "count": { "$sum": 1 } } }
+]')
+```
+
+## Pipeline d'agrégation - Limites
+
+Chaque document de la collection résultante est limité à 16MB : il s'agit d'une contrainte liée au format BSON utilisé dans MongoDB.
+
+Chaque stage est limité à 100MB de RAM : cela peut poser des problèmes lorsque les jeux de données sont volumineux.
+
+Le pipeline est limité aux opérateurs définis par MongoDB : il n'est pas possible d'utiliser des fonctions plus "souples" pour calculer le résultat d'une agrégation.
+
+## MapReduce
+
+MongoDB propose une alternative pour réaliser des agrégations : **MapReduce**
+
+MapReduce est un **patron d'architecture** breveté par Google en 2004. Le principe est de **paralléliser** les calculs qui peuvent alors être **distribués** et de rendre cela invisible à l'utilisateur. Pour cela, MapReduce opère en deux étapes :
+
+- **map** : fonction appliquée à chaque document qui **émet** une sortie,
+- **reduce** : les sorties des appels **map** sont regroupées pour produire le résultat.
+
+[<img class="center" src="img/Mapreduce-schema.png" width="70%" />](https://commons.wikimedia.org/wiki/File:Mapreduce.png)
+
+## MapReduce
+
+Quelques remarques pour MapReduce avec MongoDB :
+
+- la sortie d'un **map** est un document, *i.e.* des paires clé/valeur,
+- les fonctions **map** et **reduce** sont écrites en JavaScript (pas en **R**),
+- le nom de la méthode à utiliser est `mapreduce`,
+- il est possible de limiter MapReduce au résultat d'une recherche avec le paramètre `query` ou de trier le résultat avec `sort`.
+
+MapReduce offre plus de souplesse que le pipeline d'agrégation mais ce dernier doit rester le choix à privilégier car MapReduce est moins efficace et plus complexe en général.
+
+## MapReduce - Compter des effectifs
+
+Considérons un premier exemple simple de MapReduce :
+
+```{r}
+m$mapreduce('function() { emit(this.pack_name, 1) }',
+            'function(key, values) { return Array.sum(values) }') %>% head(7)
+```
+
+<img style="position: absolute; top: 45%; left: 40%;" src="img/mapreduce.png" width="58%" />
+
+## MapReduce - Calculer des moyennes
+
+Voici comment obtenir la longueur moyenne des noms en fonction de la *Sphere* :
+
+```{r}
+m$mapreduce('function() { emit(this.sphere_name, this.name.length) }',
+            'function(key, values) { return Array.sum(values) / values.length }'
+)
+```
+
+----
+
+<div class="exercice">À vous de jouer!</div>
